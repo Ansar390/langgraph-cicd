@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 jobs:
+  # STEP 1: Continuous Integration
   build-and-test:
     runs-on: ubuntu-latest
 
@@ -24,24 +25,40 @@ jobs:
       - name: Test Docker Build
         run: docker build -t langgraph-one-agent .
 
+  # STEP 2: Continuous Deployment
   deploy:
     needs: build-and-test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
+      # Configure SSH using Base64
       - name: Configure SSH
         env:
-          SSH_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
+          SSH_KEY_B64: ${{ secrets.AZURE_VM_SSH_KEY_B64 }}
           KNOWN_HOSTS: ${{ secrets.AZURE_VM_KNOWN_HOSTS }}
         run: |
+          set -e
+
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+
+          # Decode private SSH key
+          test -n "$SSH_KEY_B64"
+          printf '%s' "$SSH_KEY_B64" | base64 -d > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+
+          # Add trusted Azure VM host key
+          test -n "$KNOWN_HOSTS"
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+          # Validate SSH private key
+          ssh-keygen -y -P "" -f ~/.ssh/id_ed25519 > /dev/null
+
+          echo "SSH key configured successfully"
+
+      # Deploy application to Azure VM
       - name: Deploy to Azure VM
         env:
           VM_HOST: ${{ secrets.AZURE_VM_HOST }}
@@ -49,28 +66,44 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
-          ssh -o BatchMode=yes "$VM_USER@$VM_HOST" bash -s -- "$REPOSITORY" "$COMMIT_SHA" <<'REMOTE'
+          ssh \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$VM_USER@$VM_HOST" \
+            bash -s -- "$REPOSITORY" "$COMMIT_SHA" <<'REMOTE'
             set -e
 
             REPOSITORY="$1"
             COMMIT_SHA="$2"
             APP_DIR="$HOME/langgraph-cicd"
+
             mkdir -p "$APP_DIR"
 
+            # Clone repository if not present
             if [ ! -d "$APP_DIR/source/.git" ]; then
-              git clone "https://github.com/$REPOSITORY.git" "$APP_DIR/source"
+              git clone \
+                "https://github.com/$REPOSITORY.git" \
+                "$APP_DIR/source"
             fi
 
+            # Get latest tested code
             cd "$APP_DIR/source"
+
             git fetch origin main
             git checkout --force "$COMMIT_SHA"
 
+            # Confirm environment variables exist
             test -s "$APP_DIR/.env"
 
+            # Build new Docker image
             docker build -t langgraph-one-agent .
 
+            # Stop and remove old container
             docker rm -f langgraph-one-agent 2>/dev/null || true
 
+            # Start updated Docker container
             docker run -d \
               --name langgraph-one-agent \
               --restart unless-stopped \
@@ -78,5 +111,8 @@ jobs:
               -p 8000:8000 \
               langgraph-one-agent
 
+            # Check running container
             docker ps --filter name=langgraph-one-agent
+
+            echo "Deployment commands completed"
           REMOTE
