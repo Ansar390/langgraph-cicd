@@ -1,5 +1,5 @@
 
-name: LangGraph CI Pipeline
+name: LangGraph CI/CD
 
 on:
   push:
@@ -15,11 +15,68 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download GitHub Code
-        uses: actions/checkout@v7
+      - name: Download Code
+        uses: actions/checkout@v6
 
       - name: Check Python Syntax
         run: python3 -m compileall -q app
 
-      - name: Build Docker Image
-        run: docker build -t langgraph-agent:latest .
+      - name: Test Docker Build
+        run: docker build -t langgraph-one-agent .
+
+  deploy:
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.AZURE_VM_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.AZURE_VM_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy to Azure VM
+        env:
+          VM_HOST: ${{ secrets.AZURE_VM_HOST }}
+          VM_USER: ${{ secrets.AZURE_VM_USER }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          ssh -o BatchMode=yes "$VM_USER@$VM_HOST" bash -s -- "$REPOSITORY" "$COMMIT_SHA" <<'REMOTE'
+            set -e
+
+            REPOSITORY="$1"
+            COMMIT_SHA="$2"
+            APP_DIR="$HOME/langgraph-cicd"
+            mkdir -p "$APP_DIR"
+
+            if [ ! -d "$APP_DIR/source/.git" ]; then
+              git clone "https://github.com/$REPOSITORY.git" "$APP_DIR/source"
+            fi
+
+            cd "$APP_DIR/source"
+            git fetch origin main
+            git checkout --force "$COMMIT_SHA"
+
+            test -s "$APP_DIR/.env"
+
+            docker build -t langgraph-one-agent .
+
+            docker rm -f langgraph-one-agent 2>/dev/null || true
+
+            docker run -d \
+              --name langgraph-one-agent \
+              --restart unless-stopped \
+              --env-file "$APP_DIR/.env" \
+              -p 8000:8000 \
+              langgraph-one-agent
+
+            docker ps --filter name=langgraph-one-agent
+          REMOTE
